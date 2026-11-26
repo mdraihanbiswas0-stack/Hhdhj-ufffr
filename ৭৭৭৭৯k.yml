@@ -1,0 +1,138 @@
+# OmniFinder — GitHub Actions: zip আনজিপ করে APK বানায়
+#
+# ব্যবহার: রিপোজিটরিতে এই ফাইল  .github/workflows/build-apk.yml  নামে রাখুন
+# এবং OmniFinder-App.zip ফাইলটি (আনজিপ না করে) রিপোজিটরির রুটে আপলোড করুন।
+# প্রতিবার push করলে (বা Actions → Run workflow চাপলে) নিজে নিজে:
+#   ১) zip খুঁজে আনজিপ করে   ২) প্রজেক্টের ফোল্ডার চিনে নেয়   ৩) Android SDK সাজায়
+#   ৪) APK বানায়   ৫) Artifacts + Releases-এ APK দেয়
+
+name: Build OmniFinder APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Unzip project (zip না থাকলে রিপোজিটরিকেই প্রজেক্ট ধরবে)
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/omni-src"
+          rm -rf "$WORK" && mkdir -p "$WORK"
+
+          ZIP="$(find . -maxdepth 3 -type f -iname '*.zip' -not -path './.git/*' | sort | head -n 1 || true)"
+          if [ -n "$ZIP" ]; then
+            echo "▶ Found zip: $ZIP"
+            unzip -q -o "$ZIP" -d "$WORK"
+            SRC="$WORK"
+          else
+            echo "▶ No zip found – using repository files directly"
+            SRC="$PWD"
+          fi
+
+          SETTINGS="$(find "$SRC" -maxdepth 4 \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -not -path '*/.git/*' | sort | head -n 1 || true)"
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::settings.gradle(.kts) পাওয়া যায়নি — zip-এর ভেতরে Android প্রজেক্ট আছে কিনা দেখুন"
+            exit 1
+          fi
+          PROJECT_DIR="$(dirname "$SETTINGS")"
+          echo "▶ Project directory: $PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          echo "▶ Project layout:"
+          (cd "$PROJECT_DIR" && find . -maxdepth 4 -not -path './.git/*' -not -path './gradle/*' | sort | head -n 80)
+
+          test -f "$PROJECT_DIR/app/src/main/assets/www/index.html" \
+            && echo "✔ index.html (অ্যাপ UI) পাওয়া গেছে" \
+            || echo "::warning::app/src/main/assets/www/index.html নেই"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK platform & build-tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build APK (release + debug)
+        shell: bash
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          if [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.jar ]; then
+            chmod +x gradlew
+            ./gradlew --no-daemon --stacktrace assembleRelease assembleDebug
+          else
+            echo "▶ gradle wrapper নেই — GitHub-এর gradle 8.9 দিয়ে বানানো হচ্ছে"
+            gradle --no-daemon --stacktrace assembleRelease assembleDebug
+          fi
+
+      - name: Collect APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          REL="$(find "$PROJECT_DIR" -path '*outputs/apk/release/*.apk' | head -n 1 || true)"
+          DBG="$(find "$PROJECT_DIR" -path '*outputs/apk/debug/*.apk' | head -n 1 || true)"
+          [ -n "$REL" ] && cp "$REL" "$GITHUB_WORKSPACE/out/OmniFinder.apk"
+          [ -n "$DBG" ] && cp "$DBG" "$GITHUB_WORKSPACE/out/OmniFinder-debug.apk"
+          ls -lh "$GITHUB_WORKSPACE/out"
+          test -f "$GITHUB_WORKSPACE/out/OmniFinder.apk"
+
+      - name: Upload APK (Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: OmniFinder-APK
+          path: out/*.apk
+          if-no-files-found: error
+
+      - name: Publish APK in Releases (ফোন থেকে সহজে নামানোর জন্য)
+        uses: softprops/action-gh-release@v2
+        continue-on-error: true
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: OmniFinder build #${{ github.run_number }}
+          body: |
+            OmniFinder APK — build #${{ github.run_number }}
+            • `OmniFinder.apk` ইনস্টল করুন (প্রতিবার একই কী দিয়ে সাইন করা, তাই আগের অ্যাপের ওপর আপডেট হবে)।
+            • হোম স্ক্রিনে চেপে ধরুন → উইজেট → OmniFinder সার্চ।
+          files: |
+            out/OmniFinder.apk
+            out/OmniFinder-debug.apk
+
+      - name: Upload build reports (শুধু ব্যর্থ হলে)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-reports
+          path: |
+            ${{ env.PROJECT_DIR }}/**/build/reports/**
+          if-no-files-found: ignore
